@@ -255,7 +255,8 @@ public class PocketAccessibilityService extends AccessibilityService {
                             Bitmap sw = hw.copy(Bitmap.Config.ARGB_8888, false);
                             hb.close();
                             int longEdge = Math.max(sw.getWidth(), sw.getHeight());
-                            float k = Math.min(1f, 1280f / longEdge);
+                            FrameUploader up = shotUp;
+                            float k = Math.min(1f, 1280f / longEdge) * (up == null ? 1f : up.scale());
                             Bitmap sc = k < 1f ? Bitmap.createScaledBitmap(sw, Math.round(sw.getWidth() * k), Math.round(sw.getHeight() * k), true) : sw;
                             ByteArrayOutputStream out = new ByteArrayOutputStream(64 * 1024);
                             FrameUploader u = shotUp;
@@ -302,17 +303,50 @@ public class PocketAccessibilityService extends AccessibilityService {
             nm.notify(9, b.build());
             return;
         }
-        // Walk through the system prompt(s): pick "Entire screen" if offered, then press Start / Allow.
-        String[] go = {"Start now", "Share screen", "Start", "Next", "Allow"};
-        long end = System.currentTimeMillis() + 15000;
-        boolean pressed = false;
+        // Walk through Android's capture prompt: open the "Share one app" dropdown, pick "Share entire screen",
+        // then press the start button. Never press start before the entire-screen choice, or it would share one app.
+        String[] buttons = {"Start now", "Share screen", "Start", "Next", "Allow"};
+        long end = System.currentTimeMillis() + 20000;
+        boolean entireChosen = false;
+        int dropdownTries = 0;
         while (System.currentTimeMillis() < end && alive && !ScreenShareService.running) {
-            sleep(500);
-            if (pressLabel("Entire screen")) { sleep(300); }
-            for (String g : go) {
-                if (pressLabel(g)) { pressed = true; sleep(700); break; }
+            sleep(600);
+            if (!entireChosen) {
+                if (pressContains("entire screen")) { entireChosen = true; sleep(500); continue; }
+                if (dropdownTries < 6 && (pressContains("one app") || pressContains("single app"))) { dropdownTries++; sleep(500); continue; }
+            }
+            for (String g : buttons) {
+                if (pressLabel(g)) { sleep(800); break; }
             }
         }
+    }
+
+    /** Like pressLabel, but matches any visible text or description that contains the given words (case-insensitive). */
+    private boolean pressContains(String needle) {
+        List<AccessibilityWindowInfo> wins = getWindows();
+        if (wins == null) return false;
+        for (int w = wins.size() - 1; w >= 0; w--) {
+            AccessibilityNodeInfo root = wins.get(w).getRoot();
+            if (root == null) continue;
+            AccessibilityNodeInfo hit = findContains(root, needle.toLowerCase(), 0);
+            if (hit != null) {
+                AccessibilityNodeInfo n = hit;
+                while (n != null && !n.isClickable()) n = n.getParent();
+                if (n != null && n.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true;
+            }
+        }
+        return false;
+    }
+
+    private AccessibilityNodeInfo findContains(AccessibilityNodeInfo n, String needle, int depth) {
+        if (n == null || depth > 25) return null;
+        CharSequence t = n.getText(), d = n.getContentDescription();
+        if ((t != null && t.toString().toLowerCase().contains(needle)) || (d != null && d.toString().toLowerCase().contains(needle))) return n;
+        for (int i = 0; i < n.getChildCount(); i++) {
+            AccessibilityNodeInfo r = findContains(n.getChild(i), needle, depth + 1);
+            if (r != null) return r;
+        }
+        return null;
     }
 
     /** Best effort: wake, swipe up, then press the PIN keys on the lock screen by their labels, then Enter/OK. */

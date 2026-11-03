@@ -151,6 +151,12 @@ public class ScreenShareService extends Service {
             Bitmap bmp = Bitmap.createBitmap(w + rowPad / p.getPixelStride(), h, Bitmap.Config.ARGB_8888);
             bmp.copyPixelsFromBuffer(buf);
             Bitmap crop = rowPad == 0 ? bmp : Bitmap.createBitmap(bmp, 0, 0, w, h);
+            float k = uploader == null ? 1f : uploader.scale();
+            if (k < 0.98f) {                       // slow link: send a smaller picture
+                Bitmap small = Bitmap.createScaledBitmap(crop, Math.max(2, Math.round(w * k)), Math.max(2, Math.round(h * k)), true);
+                if (crop != bmp) crop.recycle();
+                crop = small;
+            }
             ByteArrayOutputStream out = new ByteArrayOutputStream(64 * 1024);
             crop.compress(Bitmap.CompressFormat.JPEG, uploader == null ? 65 : uploader.quality(), out);
             if (crop != bmp) crop.recycle();

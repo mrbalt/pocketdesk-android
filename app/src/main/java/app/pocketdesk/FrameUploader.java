@@ -17,6 +17,7 @@ public class FrameUploader {
     private byte[] pending;
     private volatile boolean alive = true;
     private volatile int quality = 65;
+    private volatile float scale = 1f;
     private int goodRun;
     private final Thread thread;
 
@@ -31,14 +32,21 @@ public class FrameUploader {
         return quality;
     }
 
+    /** Picture size factor (1 = full, down to 0.4): shrinks when frames keep being dropped, grows back when the link keeps up. */
+    public float scale() {
+        return scale;
+    }
+
     /** Hand over the newest frame. If the previous one is still waiting, it is dropped and quality goes down a notch. */
     public void offer(byte[] jpeg) {
         synchronized (lock) {
-            if (pending != null) {
-                quality = Math.max(30, quality - 4);
+            if (pending != null) {                      // the link could not take the last frame: send less data
+                if (quality > 40) quality -= 4;
+                else scale = Math.max(0.4f, scale * 0.88f);
                 goodRun = 0;
-            } else if (++goodRun >= 15 && quality < 80) {
-                quality += 2;
+            } else if (++goodRun >= 15) {              // a run of frames went out in time: win some back
+                if (scale < 1f) scale = Math.min(1f, scale * 1.08f);
+                else if (quality < 80) quality += 2;
                 goodRun = 0;
             }
             pending = jpeg;
