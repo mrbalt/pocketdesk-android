@@ -355,6 +355,8 @@ public class MainActivity extends Activity {
                 .putExtra(ScreenShareService.EXTRA_URL, base);
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(svc); else startService(svc);
         Toast.makeText(this, "Sharing to PocketDesk. Open Phone screen on the PC.", Toast.LENGTH_LONG).show();
+        // Get out of the way: the PC should see (and tap) your real screen, not the PocketDesk app itself.
+        root.postDelayed(() -> moveTaskToBack(true), 600);
     }
 
     @Override
