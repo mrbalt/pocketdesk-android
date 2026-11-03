@@ -2,7 +2,12 @@ package app.pocketdesk;
 
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Path;
 import android.os.Build;
@@ -134,6 +139,9 @@ public class PocketAccessibilityService extends AccessibilityService {
             case "unlock":
                 unlock(c.optString("pin", ""));
                 break;
+            case "share":
+                if (c.optBoolean("on", true)) startSharing(); else stopService(new Intent(this, ScreenShareService.class));
+                break;
             default:
                 break;
         }
@@ -188,6 +196,39 @@ public class PocketAccessibilityService extends AccessibilityService {
         PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
         PowerManager.WakeLock wl = pm.newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK | PowerManager.ACQUIRE_CAUSES_WAKEUP, "pocketdesk:wake");
         wl.acquire(4000);
+    }
+
+    /** Opens PocketDesk, which shows Android's screen-capture prompt, then taps through that prompt. */
+    private void startSharing() {
+        if (ScreenShareService.running) return;
+        Intent i = new Intent(this, MainActivity.class)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+                .putExtra(MainActivity.EXTRA_AUTOSHARE, true);
+        try {
+            startActivity(i);
+        } catch (Exception e) {
+            // Android refused to open it from the background: leave a notification the person can tap instead
+            NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+            if (Build.VERSION.SDK_INT >= 26) nm.createNotificationChannel(new NotificationChannel("share-ask", "Share requests", NotificationManager.IMPORTANCE_HIGH));
+            int pf = PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0);
+            Notification.Builder b = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, "share-ask") : new Notification.Builder(this);
+            b.setContentTitle("Your PC asked to share this screen").setContentText("Tap to start sharing")
+                    .setSmallIcon(android.R.drawable.ic_menu_share).setAutoCancel(true)
+                    .setContentIntent(PendingIntent.getActivity(this, 1, i, pf));
+            nm.notify(9, b.build());
+            return;
+        }
+        // Walk through the system prompt(s): pick "Entire screen" if offered, then press Start / Allow.
+        String[] go = {"Start now", "Share screen", "Start", "Next", "Allow"};
+        long end = System.currentTimeMillis() + 15000;
+        boolean pressed = false;
+        while (System.currentTimeMillis() < end && alive && !ScreenShareService.running) {
+            sleep(500);
+            if (pressLabel("Entire screen")) { sleep(300); }
+            for (String g : go) {
+                if (pressLabel(g)) { pressed = true; sleep(700); break; }
+            }
+        }
     }
 
     /** Best effort: wake, swipe up, then press the PIN keys on the lock screen by their labels, then Enter/OK. */

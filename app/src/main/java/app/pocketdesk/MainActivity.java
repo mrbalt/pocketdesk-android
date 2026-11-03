@@ -49,6 +49,7 @@ public class MainActivity extends Activity {
     private TextView errorText;
     private String url;
     private static final int REQ_SHARE = 41, REQ_NOTIF = 42;
+    public static final String EXTRA_AUTOSHARE = "autoshare";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -68,6 +69,10 @@ public class MainActivity extends Activity {
             showSetup(null);
         } else {
             showWeb();
+            if (getIntent() != null && getIntent().getBooleanExtra(EXTRA_AUTOSHARE, false) && !ScreenShareService.running) {
+                getIntent().removeExtra(EXTRA_AUTOSHARE);
+                root.post(this::startShare);      // opened by the PC's "Start sharing": go straight to the capture prompt
+            }
         }
     }
 
@@ -317,6 +322,16 @@ public class MainActivity extends Activity {
         } catch (Exception ignored) {}
         MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
         startActivityForResult(mpm.createScreenCaptureIntent(), REQ_SHARE);
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        if (intent != null && intent.getBooleanExtra(EXTRA_AUTOSHARE, false) && !ScreenShareService.running && url != null && web != null) {
+            intent.removeExtra(EXTRA_AUTOSHARE);
+            startShare();     // the PocketDesk app on the PC asked for this
+        }
     }
 
     @Override
