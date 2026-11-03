@@ -2,7 +2,10 @@ package app.pocketdesk;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.Intent;
 import android.content.SharedPreferences;
+import android.media.projection.MediaProjectionManager;
+import android.widget.Toast;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.net.Uri;
@@ -45,6 +48,7 @@ public class MainActivity extends Activity {
     private LinearLayout errorView;
     private TextView errorText;
     private String url;
+    private static final int REQ_SHARE = 41, REQ_NOTIF = 42;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -283,16 +287,51 @@ public class MainActivity extends Activity {
         }
         new AlertDialog.Builder(this)
                 .setTitle("PocketDesk")
-                .setItems(new CharSequence[]{"Keep using", "Reload", "Change address", "Exit"}, (dialog, which) -> {
+                .setItems(new CharSequence[]{"Keep using", "Reload", ScreenShareService.running ? "Stop sharing phone screen" : "Share phone screen", "Change address", "Exit"}, (dialog, which) -> {
                     if (which == 1 && web != null) {
                         web.loadUrl(url);
                     } else if (which == 2) {
-                        showSetup(null);
+                        if (ScreenShareService.running) stopService(new Intent(this, ScreenShareService.class));
+                        else startShare();
                     } else if (which == 3) {
+                        showSetup(null);
+                    } else if (which == 4) {
                         finish();
                     }
                 })
                 .show();
+    }
+
+    private void startShare() {
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, REQ_NOTIF);
+            return;
+        }
+        MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
+        startActivityForResult(mpm.createScreenCaptureIntent(), REQ_SHARE);
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int req, String[] perms, int[] results) {
+        super.onRequestPermissionsResult(req, perms, results);
+        if (req == REQ_NOTIF) startShare();   // the notification is optional for the service to run; continue either way
+    }
+
+    @Override
+    protected void onActivityResult(int req, int result, Intent data) {
+        super.onActivityResult(req, result, data);
+        if (req != REQ_SHARE) return;
+        if (result != RESULT_OK || data == null || url == null) {
+            Toast.makeText(this, "Screen sharing cancelled", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        String base = url.replaceAll("/+$", "");
+        Intent svc = new Intent(this, ScreenShareService.class)
+                .putExtra(ScreenShareService.EXTRA_CODE, result)
+                .putExtra(ScreenShareService.EXTRA_DATA, data)
+                .putExtra(ScreenShareService.EXTRA_URL, base);
+        if (Build.VERSION.SDK_INT >= 26) startForegroundService(svc); else startService(svc);
+        Toast.makeText(this, "Sharing to PocketDesk. Open Phone screen on the PC.", Toast.LENGTH_LONG).show();
     }
 
     @Override
