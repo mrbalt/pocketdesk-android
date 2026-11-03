@@ -55,10 +55,8 @@ public class ScreenShareService extends Service {
     private HandlerThread thread;
     private Handler handler;
     private String base;
-    private volatile boolean uploading;
+    private FrameUploader uploader;
     private long lastSent;
-    private int quality = 70;
-    private int failures;
     private PowerManager.WakeLock wake;
     private WifiManager.WifiLock wifi;
 
@@ -98,6 +96,7 @@ public class ScreenShareService extends Service {
                     stopSelf();
                 }
             }, handler);
+            uploader = new FrameUploader(base);
             startCapture();
             running = true;
         } catch (Exception e) {
@@ -145,7 +144,7 @@ public class ScreenShareService extends Service {
             img = r.acquireLatestImage();
             if (img == null) return;
             long now = SystemClock.uptimeMillis();
-            if (uploading || now - lastSent < MIN_GAP_MS) return;   // drop frames rather than queue them
+            if (now - lastSent < MIN_GAP_MS) return;                 // ~15 fps ceiling
             Image.Plane p = img.getPlanes()[0];
             ByteBuffer buf = p.getBuffer();
             int rowPad = p.getRowStride() - p.getPixelStride() * w;
@@ -153,53 +152,15 @@ public class ScreenShareService extends Service {
             bmp.copyPixelsFromBuffer(buf);
             Bitmap crop = rowPad == 0 ? bmp : Bitmap.createBitmap(bmp, 0, 0, w, h);
             ByteArrayOutputStream out = new ByteArrayOutputStream(64 * 1024);
-            crop.compress(Bitmap.CompressFormat.JPEG, quality, out);
+            crop.compress(Bitmap.CompressFormat.JPEG, uploader == null ? 65 : uploader.quality(), out);
             if (crop != bmp) crop.recycle();
             bmp.recycle();
             lastSent = now;
-            upload(out.toByteArray());
+            if (uploader != null) uploader.offer(out.toByteArray());
         } catch (Exception ignored) {
         } finally {
             if (img != null) img.close();
         }
-    }
-
-    private void upload(final byte[] jpeg) {
-        uploading = true;
-        new Thread(() -> {
-            long t0 = SystemClock.uptimeMillis();
-            HttpURLConnection c = null;
-            try {
-                c = (HttpURLConnection) new URL(base + "/phone/frame").openConnection();
-                c.setRequestMethod("POST");
-                c.setDoOutput(true);
-                c.setConnectTimeout(4000);
-                c.setReadTimeout(4000);
-                c.setFixedLengthStreamingMode(jpeg.length);
-                c.setRequestProperty("Content-Type", "image/jpeg");
-                String ck = CookieManager.getInstance().getCookie(base);
-                if (ck != null) c.setRequestProperty("Cookie", ck);
-                try (OutputStream os = c.getOutputStream()) { os.write(jpeg); }
-                int code = c.getResponseCode();
-                if (code == 204 || code == 200) {
-                    failures = 0;
-                    long took = SystemClock.uptimeMillis() - t0;
-                    // adapt picture quality to the link: slow uploads -> smaller frames
-                    if (took > 220 && quality > 35) quality -= 5;
-                    else if (took < 90 && quality < 80) quality += 2;
-                } else if (code == 401) {
-                    failures += 10;            // not logged in: open PocketDesk and log in first
-                } else {
-                    failures++;
-                }
-            } catch (Exception e) {
-                failures++;
-            } finally {
-                if (c != null) c.disconnect();
-                uploading = false;
-                if (failures >= 30) stopSelf();   // PC unreachable for a long while: stop quietly
-            }
-        }, "pd-upload").start();
     }
 
     @Override
@@ -212,23 +173,7 @@ public class ScreenShareService extends Service {
         try { if (reader != null) reader.close(); } catch (Exception ignored) {}
         try { if (projection != null) projection.stop(); } catch (Exception ignored) {}
         if (thread != null) thread.quitSafely();
-        final String b = base;
-        if (b != null) {
-            new Thread(() -> {                    // tell the PC viewer we stopped
-                try {
-                    HttpURLConnection c = (HttpURLConnection) new URL(b + "/phone/stop").openConnection();
-                    c.setRequestMethod("POST");
-                    c.setDoOutput(true);
-                    c.setFixedLengthStreamingMode(0);
-                    c.setConnectTimeout(2000);
-                    c.setReadTimeout(2000);
-                    String ck = CookieManager.getInstance().getCookie(b);
-                    if (ck != null) c.setRequestProperty("Cookie", ck);
-                    c.getResponseCode();
-                    c.disconnect();
-                } catch (Exception ignored) {}
-            }).start();
-        }
+        if (uploader != null) uploader.stop(true);   // also tells the PC viewer that sharing ended
         super.onDestroy();
     }
 

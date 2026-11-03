@@ -9,7 +9,15 @@ import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.graphics.Bitmap;
 import android.graphics.Path;
+import android.hardware.HardwareBuffer;
+import android.os.SystemClock;
+import android.view.Display;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.PowerManager;
@@ -36,6 +44,10 @@ public class PocketAccessibilityService extends AccessibilityService {
     public static volatile boolean connected = false;
     private volatile boolean alive;
     private Thread poller;
+    private volatile boolean shotLoop;
+    private FrameUploader shotUp;
+    private PowerManager.WakeLock shotWake;
+    public static volatile boolean sharing = false;
 
     @Override
     protected void onServiceConnected() {
@@ -57,6 +69,7 @@ public class PocketAccessibilityService extends AccessibilityService {
     public boolean onUnbind(android.content.Intent intent) {
         alive = false;
         connected = false;
+        stopScreenshotShare();
         return super.onUnbind(intent);
     }
 
@@ -140,7 +153,9 @@ public class PocketAccessibilityService extends AccessibilityService {
                 unlock(c.optString("pin", ""));
                 break;
             case "share":
-                if (c.optBoolean("on", true)) startSharing(); else stopService(new Intent(this, ScreenShareService.class));
+                if (!c.optBoolean("on", true)) { stopScreenshotShare(); stopService(new Intent(this, ScreenShareService.class)); }
+                else if ("projection".equals(c.optString("mode", "screenshot"))) startSharing();   // smooth, but Android shows its prompt
+                else startScreenshotShare();                                                      // no prompt, about 3 frames a second
                 break;
             default:
                 break;
@@ -198,9 +213,78 @@ public class PocketAccessibilityService extends AccessibilityService {
         wl.acquire(4000);
     }
 
+    // ------------------------------------------------------------------ prompt-free sharing (screenshots)
+
+    private void startScreenshotShare() {
+        String base = baseUrl();
+        if (shotLoop || base == null || Build.VERSION.SDK_INT < 30) return;
+        shotLoop = true;
+        sharing = true;
+        shotUp = new FrameUploader(base);
+        try {
+            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            shotWake = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "pocketdesk:shots");
+            shotWake.acquire();
+        } catch (Exception ignored) { }
+        Thread t = new Thread(this::shotRun, "pd-shot");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private void stopScreenshotShare() {
+        shotLoop = false;
+        sharing = false;
+        FrameUploader u = shotUp;
+        shotUp = null;
+        if (u != null) u.stop(true);
+        try { if (shotWake != null && shotWake.isHeld()) shotWake.release(); } catch (Exception ignored) { }
+    }
+
+    private void shotRun() {
+        final Executor ex = Executors.newSingleThreadExecutor();
+        while (shotLoop && alive) {
+            long t0 = SystemClock.uptimeMillis();
+            final CountDownLatch done = new CountDownLatch(1);
+            try {
+                takeScreenshot(Display.DEFAULT_DISPLAY, ex, new TakeScreenshotCallback() {
+                    @Override
+                    public void onSuccess(ScreenshotResult r) {
+                        try {
+                            HardwareBuffer hb = r.getHardwareBuffer();
+                            Bitmap hw = Bitmap.wrapHardwareBuffer(hb, r.getColorSpace());
+                            Bitmap sw = hw.copy(Bitmap.Config.ARGB_8888, false);
+                            hb.close();
+                            int longEdge = Math.max(sw.getWidth(), sw.getHeight());
+                            float k = Math.min(1f, 1280f / longEdge);
+                            Bitmap sc = k < 1f ? Bitmap.createScaledBitmap(sw, Math.round(sw.getWidth() * k), Math.round(sw.getHeight() * k), true) : sw;
+                            ByteArrayOutputStream out = new ByteArrayOutputStream(64 * 1024);
+                            FrameUploader u = shotUp;
+                            sc.compress(Bitmap.CompressFormat.JPEG, u == null ? 65 : u.quality(), out);
+                            if (u != null) u.offer(out.toByteArray());
+                            if (sc != sw) sc.recycle();
+                            sw.recycle();
+                        } catch (Exception ignored) {
+                        } finally {
+                            done.countDown();
+                        }
+                    }
+
+                    @Override
+                    public void onFailure(int errorCode) {
+                        done.countDown();
+                    }
+                });
+                done.await(3, TimeUnit.SECONDS);
+            } catch (Exception ignored) { }
+            long wait = 350 - (SystemClock.uptimeMillis() - t0);   // Android allows a screenshot only every ~1/3 s
+            if (wait > 0) sleep(wait);
+        }
+    }
+
     /** Opens PocketDesk, which shows Android's screen-capture prompt, then taps through that prompt. */
     private void startSharing() {
         if (ScreenShareService.running) return;
+        stopScreenshotShare();
         Intent i = new Intent(this, MainActivity.class)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
                 .putExtra(MainActivity.EXTRA_AUTOSHARE, true);
