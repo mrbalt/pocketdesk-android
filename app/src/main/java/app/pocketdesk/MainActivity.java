@@ -287,15 +287,17 @@ public class MainActivity extends Activity {
         }
         new AlertDialog.Builder(this)
                 .setTitle("PocketDesk")
-                .setItems(new CharSequence[]{"Keep using", "Reload", ScreenShareService.running ? "Stop sharing phone screen" : "Share phone screen", "Change address", "Exit"}, (dialog, which) -> {
+                .setItems(new CharSequence[]{"Keep using", "Reload", ScreenShareService.running ? "Stop sharing phone screen" : "Share phone screen", PocketAccessibilityService.connected ? "Phone control: ON (settings)" : "Turn on phone control (Accessibility)", "Change address", "Exit"}, (dialog, which) -> {
                     if (which == 1 && web != null) {
                         web.loadUrl(url);
                     } else if (which == 2) {
                         if (ScreenShareService.running) stopService(new Intent(this, ScreenShareService.class));
                         else startShare();
                     } else if (which == 3) {
-                        showSetup(null);
+                        startActivity(new Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS));
                     } else if (which == 4) {
+                        showSetup(null);
+                    } else if (which == 5) {
                         finish();
                     }
                 })
