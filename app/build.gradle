@@ -1,0 +1,48 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'app.pocketdesk'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'app.pocketdesk'
+        minSdk 24
+        // 34 on purpose: keeps the soft keyboard resizing the page normally (Android 15 forces edge-to-edge above that)
+        targetSdk 34
+        versionCode 1
+        versionName '0.2.0'
+    }
+
+    // One fixed key for every build, so a newer APK installs over the old one without uninstalling first.
+    // This is a personal side-loaded app, not a Play Store release. Make your own with keytool if you like.
+    signingConfigs {
+        personal {
+            storeFile file('pocketdesk.keystore')
+            storePassword 'pocketdesk'
+            keyAlias 'pocketdesk'
+            keyPassword 'pocketdesk'
+        }
+    }
+
+    buildTypes {
+        release {
+            signingConfig signingConfigs.personal
+            minifyEnabled false
+        }
+        debug {
+            signingConfig signingConfigs.personal
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}
