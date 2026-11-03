@@ -20,7 +20,9 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
+import android.os.PowerManager;
 import android.os.SystemClock;
+import android.net.wifi.WifiManager;
 import android.util.DisplayMetrics;
 import android.webkit.CookieManager;
 
@@ -57,6 +59,8 @@ public class ScreenShareService extends Service {
     private long lastSent;
     private int quality = 70;
     private int failures;
+    private PowerManager.WakeLock wake;
+    private WifiManager.WifiLock wifi;
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
@@ -72,6 +76,14 @@ public class ScreenShareService extends Service {
             return START_NOT_STICKY;
         }
         startForegroundCompat();
+        try {   // keep the CPU and Wi-Fi alive while the screen is locked
+            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            wake = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "pocketdesk:share");
+            wake.acquire();
+            WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+            wifi = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "pocketdesk:share");
+            wifi.acquire();
+        } catch (Exception ignored) {}
         try {
             MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(Context.MEDIA_PROJECTION_SERVICE);
             projection = mpm.getMediaProjection(code, data);
@@ -193,6 +205,8 @@ public class ScreenShareService extends Service {
     @Override
     public void onDestroy() {
         running = false;
+        try { if (wake != null && wake.isHeld()) wake.release(); } catch (Exception ignored) {}
+        try { if (wifi != null && wifi.isHeld()) wifi.release(); } catch (Exception ignored) {}
         try { if (reader != null) reader.setOnImageAvailableListener(null, null); } catch (Exception ignored) {}
         try { if (display != null) display.release(); } catch (Exception ignored) {}
         try { if (reader != null) reader.close(); } catch (Exception ignored) {}
