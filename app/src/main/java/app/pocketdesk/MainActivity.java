@@ -309,10 +309,18 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    private boolean permsAsked;
+
     private void startShare() {
-        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, REQ_NOTIF);
-            return;
+        if (!permsAsked) {          // ask once for notifications (Android 13+) and for capturing sound (Android 10+), then carry on either way
+            java.util.ArrayList<String> need = new java.util.ArrayList<>();
+            if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != android.content.pm.PackageManager.PERMISSION_GRANTED) need.add("android.permission.POST_NOTIFICATIONS");
+            if (Build.VERSION.SDK_INT >= 29 && checkSelfPermission("android.permission.RECORD_AUDIO") != android.content.pm.PackageManager.PERMISSION_GRANTED) need.add("android.permission.RECORD_AUDIO");
+            if (!need.isEmpty()) {
+                permsAsked = true;
+                requestPermissions(need.toArray(new String[0]), REQ_NOTIF);
+                return;
+            }
         }
         try {   // ask once to be exempt from battery limits so sharing survives a locked screen
             android.os.PowerManager pm = (android.os.PowerManager) getSystemService(POWER_SERVICE);
@@ -371,7 +379,10 @@ public class MainActivity extends Activity {
     protected void onPause() {
         super.onPause();
         CookieManager.getInstance().flush();
-        if (web != null) {
+        // Keep the page (and the PC's audio) running while the phone is shared or controlled from the PC:
+        // the app sits in the background then, and pausing the WebView would silence it.
+        boolean keepAlive = ScreenShareService.running || PocketAccessibilityService.sharing || PocketAccessibilityService.connected;
+        if (web != null && !keepAlive) {
             web.onPause();
         }
     }

@@ -12,6 +12,10 @@ import android.graphics.Bitmap;
 import android.graphics.PixelFormat;
 import android.hardware.display.DisplayManager;
 import android.hardware.display.VirtualDisplay;
+import android.media.AudioAttributes;
+import android.media.AudioFormat;
+import android.media.AudioPlaybackCaptureConfiguration;
+import android.media.AudioRecord;
 import android.media.Image;
 import android.media.ImageReader;
 import android.media.projection.MediaProjection;
@@ -46,8 +50,7 @@ public class ScreenShareService extends Service {
 
     private static final String CHANNEL = "share";
     private static final int NOTE_ID = 7;
-    private static final int LONG_EDGE = 1280;      // frames are scaled so the longer side is at most this
-    private static final long MIN_GAP_MS = 66;      // ~15 fps ceiling; the network decides the real rate
+    private static final int LONG_EDGE = 1920;      // capture size; ShareSettings.maxEdge scales it down live
 
     private MediaProjection projection;
     private VirtualDisplay display;
@@ -56,6 +59,9 @@ public class ScreenShareService extends Service {
     private Handler handler;
     private String base;
     private FrameUploader uploader;
+    private AudioUploader audioUp;
+    private AudioRecord audioRec;
+    private volatile boolean audioLoop;
     private long lastSent;
     private PowerManager.WakeLock wake;
     private WifiManager.WifiLock wifi;
@@ -98,6 +104,7 @@ public class ScreenShareService extends Service {
             }, handler);
             uploader = new FrameUploader(base);
             startCapture();
+            startAudio();
             running = true;
         } catch (Exception e) {
             stopSelf();
@@ -138,20 +145,86 @@ public class ScreenShareService extends Service {
         reader.setOnImageAvailableListener(r -> onFrame(r, w, h), handler);
     }
 
+    @Override
+    public void onConfigurationChanged(android.content.res.Configuration cfg) {
+        super.onConfigurationChanged(cfg);
+        if (handler != null && display != null) handler.postDelayed(this::resizeCapture, 300);   // the phone turned: follow it
+    }
+
+    private void resizeCapture() {
+        try {
+            DisplayMetrics m = getResources().getDisplayMetrics();
+            float scale = Math.min(1f, (float) LONG_EDGE / Math.max(m.widthPixels, m.heightPixels));
+            final int w = Math.max(2, Math.round(m.widthPixels * scale) & ~1);
+            final int h = Math.max(2, Math.round(m.heightPixels * scale) & ~1);
+            ImageReader old = reader;
+            ImageReader nr = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2);
+            display.resize(w, h, m.densityDpi);
+            display.setSurface(nr.getSurface());
+            nr.setOnImageAvailableListener(r -> onFrame(r, w, h), handler);
+            reader = nr;
+            if (old != null) { old.setOnImageAvailableListener(null, null); old.close(); }
+        } catch (Exception ignored) { }
+    }
+
+    /** Captures what other apps play (Android 10+, needs the microphone permission) and streams it to the PC. */
+    private void startAudio() {
+        if (Build.VERSION.SDK_INT < 29 || checkSelfPermission("android.permission.RECORD_AUDIO") != android.content.pm.PackageManager.PERMISSION_GRANTED) return;
+        try {
+            AudioPlaybackCaptureConfiguration cfg = new AudioPlaybackCaptureConfiguration.Builder(projection)
+                    .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                    .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                    .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                    .build();
+            final int rate = 32000;
+            AudioFormat fmt = new AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(rate)
+                    .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+                    .build();
+            int min = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT);
+            audioRec = new AudioRecord.Builder()
+                    .setAudioFormat(fmt)
+                    .setBufferSizeInBytes(Math.max(min, 16384))
+                    .setAudioPlaybackCaptureConfig(cfg)
+                    .build();
+            audioUp = new AudioUploader(base, rate, 2);
+            audioRec.startRecording();
+            audioLoop = true;
+            Thread t = new Thread(() -> {
+                byte[] buf = new byte[rate * 2 * 2 / 40];     // 25 ms of 16-bit stereo
+                while (audioLoop) {
+                    int n = audioRec.read(buf, 0, buf.length);
+                    if (n > 0) {
+                        byte[] out = new byte[n];
+                        System.arraycopy(buf, 0, out, 0, n);
+                        audioUp.offer(out);
+                    } else if (n < 0) {
+                        break;
+                    }
+                }
+            }, "pd-audio-read");
+            t.setDaemon(true);
+            t.start();
+        } catch (Exception e) {
+            audioLoop = false;     // sound is a bonus: carry on with the picture only
+        }
+    }
+
     private void onFrame(ImageReader r, int w, int h) {
         Image img = null;
         try {
             img = r.acquireLatestImage();
             if (img == null) return;
             long now = SystemClock.uptimeMillis();
-            if (now - lastSent < MIN_GAP_MS) return;                 // ~15 fps ceiling
+            if (now - lastSent < ShareSettings.minGapMs()) return;                 // ~15 fps ceiling
             Image.Plane p = img.getPlanes()[0];
             ByteBuffer buf = p.getBuffer();
             int rowPad = p.getRowStride() - p.getPixelStride() * w;
             Bitmap bmp = Bitmap.createBitmap(w + rowPad / p.getPixelStride(), h, Bitmap.Config.ARGB_8888);
             bmp.copyPixelsFromBuffer(buf);
             Bitmap crop = rowPad == 0 ? bmp : Bitmap.createBitmap(bmp, 0, 0, w, h);
-            float k = uploader == null ? 1f : uploader.scale();
+            float k = Math.min(1f, (float) ShareSettings.maxEdge / Math.max(w, h)) * (uploader == null ? 1f : uploader.scale());
             if (k < 0.98f) {                       // slow link: send a smaller picture
                 Bitmap small = Bitmap.createScaledBitmap(crop, Math.max(2, Math.round(w * k)), Math.max(2, Math.round(h * k)), true);
                 if (crop != bmp) crop.recycle();
@@ -175,6 +248,9 @@ public class ScreenShareService extends Service {
         try { if (wake != null && wake.isHeld()) wake.release(); } catch (Exception ignored) {}
         try { if (wifi != null && wifi.isHeld()) wifi.release(); } catch (Exception ignored) {}
         try { if (reader != null) reader.setOnImageAvailableListener(null, null); } catch (Exception ignored) {}
+        audioLoop = false;
+        try { if (audioRec != null) { audioRec.stop(); audioRec.release(); } } catch (Exception ignored) {}
+        if (audioUp != null) audioUp.stop();
         try { if (display != null) display.release(); } catch (Exception ignored) {}
         try { if (reader != null) reader.close(); } catch (Exception ignored) {}
         try { if (projection != null) projection.stop(); } catch (Exception ignored) {}

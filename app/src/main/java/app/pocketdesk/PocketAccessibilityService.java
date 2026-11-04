@@ -94,6 +94,7 @@ public class PocketAccessibilityService extends AccessibilityService {
             String base = baseUrl();
             if (base == null) { sleep(3000); continue; }
             HttpURLConnection c = null;
+            boolean failed = false;
             try {
                 c = (HttpURLConnection) new URL(base + "/phone/cmd/poll?timeout=20").openConnection();
                 c.setConnectTimeout(5000);
@@ -108,10 +109,11 @@ public class PocketAccessibilityService extends AccessibilityService {
                     try { run(cmds.getJSONObject(i)); } catch (Exception ignored) { }
                 }
             } catch (Exception e) {
+                failed = true;
                 sleep(backoff);
                 backoff = Math.min(backoff * 2, 8000);
             } finally {
-                if (c != null) c.disconnect();
+                if (c != null && failed) c.disconnect();     // otherwise keep the connection for the next poll: much quicker for games
             }
         }
     }
@@ -152,6 +154,16 @@ public class PocketAccessibilityService extends AccessibilityService {
             case "unlock":
                 unlock(c.optString("pin", ""));
                 break;
+            case "touch":
+                touch(c.optString("p", "u"), c.optDouble("x", 0), c.optDouble("y", 0));
+                break;
+            case "rot":
+                orient(c.optString("o", "auto"));
+                break;
+            case "cfg":
+                ShareSettings.maxFps = Math.max(1, Math.min(60, c.optInt("fps", 30)));
+                ShareSettings.maxEdge = Math.max(320, Math.min(3840, c.optInt("edge", 1280)));
+                break;
             case "share":
                 if (!c.optBoolean("on", true)) { stopScreenshotShare(); stopService(new Intent(this, ScreenShareService.class)); }
                 else if ("projection".equals(c.optString("mode", "screenshot"))) startSharing();   // smooth, but Android shows its prompt
@@ -160,6 +172,80 @@ public class PocketAccessibilityService extends AccessibilityService {
             default:
                 break;
         }
+    }
+
+    // ---- live touch: a finger that stays down while the PC mouse is held, so games can hold and drag
+    private final Object touchLock = new Object();
+    private GestureDescription.StrokeDescription touchStroke;
+    private boolean touchBusy, wantMove, wantUp;
+    private float lastX, lastY, wantX, wantY;
+
+    private final AccessibilityService.GestureResultCallback touchCb = new AccessibilityService.GestureResultCallback() {
+        @Override public void onCompleted(GestureDescription g) { synchronized (touchLock) { touchBusy = false; touchPump(); } }
+        @Override public void onCancelled(GestureDescription g) { synchronized (touchLock) { touchBusy = false; touchStroke = null; wantMove = false; wantUp = false; } }
+    };
+
+    private void touch(String phase, double fx, double fy) {
+        DisplayMetrics m = getResources().getDisplayMetrics();
+        float x = (float) (fx * (m.widthPixels - 1)), y = (float) (fy * (m.heightPixels - 1));
+        synchronized (touchLock) {
+            if (phase.equals("d") && touchStroke == null && !touchBusy) {
+                lastX = x; lastY = y; wantMove = false; wantUp = false;
+                Path p = new Path();
+                p.moveTo(x, y);
+                touchStroke = new GestureDescription.StrokeDescription(p, 0, 1, true);
+                touchBusy = true;
+                if (!dispatchGesture(new GestureDescription.Builder().addStroke(touchStroke).build(), touchCb, null)) { touchBusy = false; touchStroke = null; }
+            } else if (phase.equals("u")) {
+                wantX = x; wantY = y; wantMove = true; wantUp = true;
+                touchPump();
+            } else if (touchStroke != null || touchBusy) {      // a move (or a stray second "down")
+                wantX = x; wantY = y; wantMove = true;
+                touchPump();
+            }
+        }
+    }
+
+    /** Sends the newest wanted finger position as the next piece of the held stroke. Call with touchLock held. */
+    private void touchPump() {
+        if (touchBusy || touchStroke == null || !(wantMove || wantUp)) return;
+        float tx = wantMove ? wantX : lastX, ty = wantMove ? wantY : lastY;
+        boolean end = wantUp;
+        Path p = new Path();
+        p.moveTo(lastX, lastY);
+        p.lineTo(tx, ty);
+        GestureDescription.StrokeDescription next = touchStroke.continueStroke(p, 0, end ? 1 : 12, !end);
+        lastX = tx; lastY = ty; wantMove = false; wantUp = false;
+        touchStroke = end ? null : next;
+        touchBusy = true;
+        if (!dispatchGesture(new GestureDescription.Builder().addStroke(next).build(), touchCb, null)) { touchBusy = false; touchStroke = null; }
+    }
+
+    // ---- really rotating the phone: a see-through window that asks Android for an orientation
+    private android.view.View rotView;
+
+    private void orient(final String o) {
+        new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
+            try {
+                android.view.WindowManager wm = (android.view.WindowManager) getSystemService(WINDOW_SERVICE);
+                if (o.equals("auto")) {
+                    if (rotView != null) { wm.removeView(rotView); rotView = null; }
+                    return;
+                }
+                android.view.WindowManager.LayoutParams lp = new android.view.WindowManager.LayoutParams(
+                        android.view.WindowManager.LayoutParams.MATCH_PARENT, android.view.WindowManager.LayoutParams.MATCH_PARENT,
+                        android.view.WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                        android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+                        android.graphics.PixelFormat.TRANSLUCENT);
+                lp.screenOrientation = o.equals("landscape") ? 6 : 7;     // SENSOR_LANDSCAPE / SENSOR_PORTRAIT
+                if (rotView == null) {
+                    rotView = new android.view.View(this);
+                    wm.addView(rotView, lp);
+                } else {
+                    wm.updateViewLayout(rotView, lp);
+                }
+            } catch (Exception ignored) { }
+        });
     }
 
     private void gesture(double x1, double y1, double x2, double y2, int ms) {
@@ -256,7 +342,7 @@ public class PocketAccessibilityService extends AccessibilityService {
                             hb.close();
                             int longEdge = Math.max(sw.getWidth(), sw.getHeight());
                             FrameUploader up = shotUp;
-                            float k = Math.min(1f, 1280f / longEdge) * (up == null ? 1f : up.scale());
+                            float k = Math.min(1f, (float) ShareSettings.maxEdge / longEdge) * (up == null ? 1f : up.scale());
                             Bitmap sc = k < 1f ? Bitmap.createScaledBitmap(sw, Math.round(sw.getWidth() * k), Math.round(sw.getHeight() * k), true) : sw;
                             ByteArrayOutputStream out = new ByteArrayOutputStream(64 * 1024);
                             FrameUploader u = shotUp;
@@ -277,7 +363,7 @@ public class PocketAccessibilityService extends AccessibilityService {
                 });
                 done.await(3, TimeUnit.SECONDS);
             } catch (Exception ignored) { }
-            long wait = 350 - (SystemClock.uptimeMillis() - t0);   // Android allows a screenshot only every ~1/3 s
+            long wait = Math.max(350, ShareSettings.minGapMs()) - (SystemClock.uptimeMillis() - t0);   // Android allows a screenshot only every ~1/3 s
             if (wait > 0) sleep(wait);
         }
     }
@@ -305,7 +391,7 @@ public class PocketAccessibilityService extends AccessibilityService {
         }
         // Walk through Android's capture prompt: open the "Share one app" dropdown, pick "Share entire screen",
         // then press the start button. Never press start before the entire-screen choice, or it would share one app.
-        String[] buttons = {"Start now", "Share screen", "Start", "Next", "Allow"};
+        String[] buttons = {"Start now", "Share screen", "Start", "Next", "While using the app", "Allow"};
         long end = System.currentTimeMillis() + 20000;
         boolean entireChosen = false;
         int dropdownTries = 0;
