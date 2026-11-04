@@ -4,6 +4,7 @@ package app.pocketdesk;
 public final class ShareSettings {
     public static volatile int maxFps = 60;
     public static volatile int maxEdge = 1280;
+    public static volatile String codec = "jpeg";      // "h264" = hardware video (smooth sharing only), chosen on the PC
 
     private ShareSettings() { }
 

@@ -205,7 +205,12 @@ public class PocketAccessibilityService extends AccessibilityService {
                 break;
             case "cfg":
                 ShareSettings.maxFps = Math.max(1, Math.min(60, c.optInt("fps", 30)));
+                int oldEdge = ShareSettings.maxEdge;
+                String oldCodec = ShareSettings.codec;
                 ShareSettings.maxEdge = Math.max(320, Math.min(3840, c.optInt("edge", 1280)));
+                String codec = c.optString("codec", oldCodec);
+                ShareSettings.codec = codec.equals("h264") ? "h264" : "jpeg";
+                if (oldEdge != ShareSettings.maxEdge || !oldCodec.equals(ShareSettings.codec)) ScreenShareService.sizeChanged();
                 break;
             case "share":
                 if (!c.optBoolean("on", true)) { stopScreenshotShare(); stopService(new Intent(this, ScreenShareService.class)); }
@@ -282,6 +287,7 @@ public class PocketAccessibilityService extends AccessibilityService {
         float x = (float) (fx * (m.widthPixels - 1)), y = (float) (fy * (m.heightPixels - 1));
         synchronized (touchLock) {
             Finger f = fingers.get(id);
+            if (f == null && phase.equals("m")) phase = "d";        // a move for a finger Android let go of: put it back down
             if (phase.equals("d")) {
                 if (f != null) return;                     // already down
                 f = new Finger();

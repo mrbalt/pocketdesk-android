@@ -20,6 +20,7 @@ import android.media.Image;
 import android.media.ImageReader;
 import android.media.projection.MediaProjection;
 import android.media.projection.MediaProjectionManager;
+import android.view.Surface;
 import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -50,7 +51,19 @@ public class ScreenShareService extends Service {
 
     private static final String CHANNEL = "share";
     private static final int NOTE_ID = 7;
-    private static final int LONG_EDGE = 1920;      // capture size; ShareSettings.maxEdge scales it down live
+    private static final int LONG_EDGE = 2560;      // never capture bigger than this
+    private static volatile ScreenShareService instance;
+
+    /** Capture right at the wanted size: no big picture to shrink for every frame. */
+    private static int captureEdge() { return Math.max(320, Math.min(LONG_EDGE, ShareSettings.maxEdge)); }
+
+    /** Called when the PC changes the picture size or the video type, so the capture follows. */
+    public static void sizeChanged() {
+        ScreenShareService s = instance;
+        if (s != null && s.handler != null && s.display != null) s.handler.post(s::applyPipeline);
+    }
+
+    private VideoStreamer video;
 
     private MediaProjection projection;
     private VirtualDisplay display;
@@ -85,7 +98,7 @@ public class ScreenShareService extends Service {
             wake = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "pocketdesk:share");
             wake.acquire();
             WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
-            wifi = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "pocketdesk:share");
+            wifi = wm.createWifiLock((Build.VERSION.SDK_INT >= 29 ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY : WifiManager.WIFI_MODE_FULL_HIGH_PERF), "pocketdesk:share");
             wifi.acquire();
         } catch (Exception ignored) {}
         try {
@@ -103,9 +116,10 @@ public class ScreenShareService extends Service {
                 }
             }, handler);
             uploader = new FrameUploader(base);
-            startCapture();
+            applyPipeline();
             startAudio();
             running = true;
+            instance = this;
         } catch (Exception e) {
             stopSelf();
         }
@@ -134,37 +148,58 @@ public class ScreenShareService extends Service {
         }
     }
 
-    private void startCapture() {
-        DisplayMetrics m = RealScreen.get(this);
-        float scale = Math.min(1f, (float) LONG_EDGE / Math.max(m.widthPixels, m.heightPixels));
-        final int w = Math.max(2, Math.round(m.widthPixels * scale) & ~1);
-        final int h = Math.max(2, Math.round(m.heightPixels * scale) & ~1);
-        reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2);
-        display = projection.createVirtualDisplay("pocketdesk-share", w, h, m.densityDpi,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader.getSurface(), null, handler);
-        reader.setOnImageAvailableListener(r -> onFrame(r, w, h), handler);
+    /**
+     * (Re)builds how the screen reaches the PC, at the size the PC asked for: either a hardware H.264 encoder fed straight from
+     * the capture, or the picture-by-picture JPEG path. The capture itself keeps running; only where it draws is switched.
+     */
+    private void applyPipeline() {
+        try {
+            DisplayMetrics m = RealScreen.get(this);
+            float scale = Math.min(1f, (float) captureEdge() / Math.max(m.widthPixels, m.heightPixels));
+            final int w = Math.max(2, Math.round(m.widthPixels * scale) & ~1);
+            final int h = Math.max(2, Math.round(m.heightPixels * scale) & ~1);
+            ImageReader oldReader = reader;
+            VideoStreamer oldVideo = video;
+            ImageReader newReader = null;
+            VideoStreamer newVideo = null;
+            Surface target = null;
+            if ("h264".equals(ShareSettings.codec)) {
+                try {
+                    int fps = Math.max(5, Math.min(60, ShareSettings.maxFps));
+                    int kbps = (int) Math.max(2500, Math.min(25000, w * (long) h * fps * 0.14 / 1000));
+                    newVideo = new VideoStreamer(base, w, h, fps, kbps);
+                    target = newVideo.surface();
+                } catch (Exception e) {
+                    PcLog.send(base, "hardware video unavailable (" + e + "), using pictures");
+                    ShareSettings.codec = "jpeg";
+                    newVideo = null;
+                }
+            }
+            if (newVideo == null) {
+                newReader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 3);
+                target = newReader.getSurface();
+            }
+            if (display == null) {
+                display = projection.createVirtualDisplay("pocketdesk-share", w, h, m.densityDpi,
+                        DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, target, null, handler);
+            } else {
+                display.resize(w, h, m.densityDpi);
+                display.setSurface(target);
+            }
+            if (newReader != null) newReader.setOnImageAvailableListener(r -> onFrame(r, w, h), handler);
+            reader = newReader;
+            video = newVideo;
+            if (oldReader != null) { oldReader.setOnImageAvailableListener(null, null); oldReader.close(); }
+            if (oldVideo != null) oldVideo.release();
+        } catch (Exception e) {
+            PcLog.send(base, "could not set up the capture: " + e);
+        }
     }
 
     @Override
     public void onConfigurationChanged(android.content.res.Configuration cfg) {
         super.onConfigurationChanged(cfg);
-        if (handler != null && display != null) handler.postDelayed(this::resizeCapture, 300);   // the phone turned: follow it
-    }
-
-    private void resizeCapture() {
-        try {
-            DisplayMetrics m = RealScreen.get(this);
-            float scale = Math.min(1f, (float) LONG_EDGE / Math.max(m.widthPixels, m.heightPixels));
-            final int w = Math.max(2, Math.round(m.widthPixels * scale) & ~1);
-            final int h = Math.max(2, Math.round(m.heightPixels * scale) & ~1);
-            ImageReader old = reader;
-            ImageReader nr = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2);
-            display.resize(w, h, m.densityDpi);
-            display.setSurface(nr.getSurface());
-            nr.setOnImageAvailableListener(r -> onFrame(r, w, h), handler);
-            reader = nr;
-            if (old != null) { old.setOnImageAvailableListener(null, null); old.close(); }
-        } catch (Exception ignored) { }
+        if (handler != null && display != null) handler.postDelayed(this::applyPipeline, 300);   // the phone turned: follow it
     }
 
     /** Captures what other apps play (Android 10+, needs the microphone permission) and streams it to the PC. */
@@ -269,6 +304,7 @@ public class ScreenShareService extends Service {
     @Override
     public void onDestroy() {
         running = false;
+        if (instance == this) instance = null;
         try { if (wake != null && wake.isHeld()) wake.release(); } catch (Exception ignored) {}
         try { if (wifi != null && wifi.isHeld()) wifi.release(); } catch (Exception ignored) {}
         try { if (reader != null) reader.setOnImageAvailableListener(null, null); } catch (Exception ignored) {}
@@ -278,6 +314,7 @@ public class ScreenShareService extends Service {
         if (audioUp != null) audioUp.stop();
         try { if (display != null) display.release(); } catch (Exception ignored) {}
         try { if (reader != null) reader.close(); } catch (Exception ignored) {}
+        try { if (video != null) video.release(); } catch (Exception ignored) {}
         try { if (projection != null) projection.stop(); } catch (Exception ignored) {}
         if (thread != null) thread.quitSafely();
         if (uploader != null) uploader.stop(true);   // also tells the PC viewer that sharing ended
