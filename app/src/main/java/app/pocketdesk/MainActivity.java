@@ -379,6 +379,8 @@ public class MainActivity extends Activity {
     protected void onPause() {
         super.onPause();
         CookieManager.getInstance().flush();
+        // Nobody is looking at the PC picture now (a game is in front, say): stop it being sent, so the phone and PC are not busy for nothing.
+        if (web != null) web.evaluateJavascript("window.pdPause&&window.pdPause(true)", null);
         // Keep the page (and the PC's audio) running while the phone is shared or controlled from the PC:
         // the app sits in the background then, and pausing the WebView would silence it.
         boolean keepAlive = ScreenShareService.running || PocketAccessibilityService.sharing || PocketAccessibilityService.connected;
@@ -392,6 +394,7 @@ public class MainActivity extends Activity {
         super.onResume();
         if (web != null) {
             web.onResume();
+            web.evaluateJavascript("window.pdPause&&window.pdPause(false)", null);
         }
     }
 
