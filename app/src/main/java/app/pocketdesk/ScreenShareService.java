@@ -135,7 +135,7 @@ public class ScreenShareService extends Service {
     }
 
     private void startCapture() {
-        DisplayMetrics m = getResources().getDisplayMetrics();
+        DisplayMetrics m = RealScreen.get(this);
         float scale = Math.min(1f, (float) LONG_EDGE / Math.max(m.widthPixels, m.heightPixels));
         final int w = Math.max(2, Math.round(m.widthPixels * scale) & ~1);
         final int h = Math.max(2, Math.round(m.heightPixels * scale) & ~1);
@@ -153,7 +153,7 @@ public class ScreenShareService extends Service {
 
     private void resizeCapture() {
         try {
-            DisplayMetrics m = getResources().getDisplayMetrics();
+            DisplayMetrics m = RealScreen.get(this);
             float scale = Math.min(1f, (float) LONG_EDGE / Math.max(m.widthPixels, m.heightPixels));
             final int w = Math.max(2, Math.round(m.widthPixels * scale) & ~1);
             final int h = Math.max(2, Math.round(m.heightPixels * scale) & ~1);
@@ -211,13 +211,19 @@ public class ScreenShareService extends Service {
         }
     }
 
+    // Two JPEG encoders work side by side, so the phone can keep up with 30-60 frames a second instead of one at a time.
+    private final java.util.concurrent.ExecutorService encoders = java.util.concurrent.Executors.newFixedThreadPool(2);
+    private final java.util.concurrent.atomic.AtomicInteger inflight = new java.util.concurrent.atomic.AtomicInteger();
+    private long frameSeq;
+    private volatile long offeredSeq;
+
     private void onFrame(ImageReader r, int w, int h) {
         Image img = null;
         try {
             img = r.acquireLatestImage();
             if (img == null) return;
             long now = SystemClock.uptimeMillis();
-            if (now - lastSent < ShareSettings.minGapMs()) return;                 // ~15 fps ceiling
+            if (now - lastSent < ShareSettings.minGapMs() || inflight.get() >= 2) return;   // frame-rate limit / both encoders busy
             Image.Plane p = img.getPlanes()[0];
             ByteBuffer buf = p.getBuffer();
             int rowPad = p.getRowStride() - p.getPixelStride() * w;
@@ -230,12 +236,30 @@ public class ScreenShareService extends Service {
                 if (crop != bmp) crop.recycle();
                 crop = small;
             }
-            ByteArrayOutputStream out = new ByteArrayOutputStream(64 * 1024);
-            crop.compress(Bitmap.CompressFormat.JPEG, uploader == null ? 65 : uploader.quality(), out);
-            if (crop != bmp) crop.recycle();
-            bmp.recycle();
+            if (crop != bmp) bmp.recycle();
             lastSent = now;
-            if (uploader != null) uploader.offer(out.toByteArray());
+            final Bitmap toEncode = crop;
+            final long my = ++frameSeq;
+            final int q = uploader == null ? 65 : uploader.quality();
+            inflight.incrementAndGet();
+            try {
+                encoders.execute(() -> {
+                    try {
+                        ByteArrayOutputStream out = new ByteArrayOutputStream(64 * 1024);
+                        toEncode.compress(Bitmap.CompressFormat.JPEG, q, out);
+                        synchronized (encoders) {
+                            if (my > offeredSeq && uploader != null) { offeredSeq = my; uploader.offer(out.toByteArray()); }
+                        }
+                    } catch (Exception ignored) {
+                    } finally {
+                        toEncode.recycle();
+                        inflight.decrementAndGet();
+                    }
+                });
+            } catch (Exception e) {
+                toEncode.recycle();
+                inflight.decrementAndGet();
+            }
         } catch (Exception ignored) {
         } finally {
             if (img != null) img.close();
@@ -248,6 +272,7 @@ public class ScreenShareService extends Service {
         try { if (wake != null && wake.isHeld()) wake.release(); } catch (Exception ignored) {}
         try { if (wifi != null && wifi.isHeld()) wifi.release(); } catch (Exception ignored) {}
         try { if (reader != null) reader.setOnImageAvailableListener(null, null); } catch (Exception ignored) {}
+        encoders.shutdownNow();
         audioLoop = false;
         try { if (audioRec != null) { audioRec.stop(); audioRec.release(); } } catch (Exception ignored) {}
         if (audioUp != null) audioUp.stop();

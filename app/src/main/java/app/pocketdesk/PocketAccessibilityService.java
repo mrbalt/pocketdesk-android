@@ -60,7 +60,50 @@ public class PocketAccessibilityService extends AccessibilityService {
     }
 
     @Override
-    public void onAccessibilityEvent(AccessibilityEvent event) { }
+    public void onAccessibilityEvent(AccessibilityEvent event) {
+        if (event == null || event.getEventType() != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED || event.getPackageName() == null) return;
+        final String pkg = event.getPackageName().toString();
+        if (pkg.equals(lastPkg) || pkg.equals(getPackageName()) || pkg.startsWith("com.android.systemui") || pkg.contains("inputmethod") || pkg.contains("keyboard")) return;
+        lastPkg = pkg;
+        new Thread(() -> reportApp(pkg), "pd-app").start();
+    }
+
+    private volatile String lastPkg = "";
+
+    /** Tells the PC which app is in front and whether it is a game, so it can switch on the game keys. */
+    private void reportApp(String pkg) {
+        String base = baseUrl();
+        if (base == null) return;
+        String label = pkg;
+        boolean game = false;
+        try {
+            android.content.pm.PackageManager pm = getPackageManager();
+            android.content.pm.ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
+            label = String.valueOf(pm.getApplicationLabel(ai));
+            game = (ai.flags & android.content.pm.ApplicationInfo.FLAG_IS_GAME) != 0
+                    || (Build.VERSION.SDK_INT >= 26 && ai.category == android.content.pm.ApplicationInfo.CATEGORY_GAME)
+                    || pkg.startsWith("com.supercell.") || pkg.startsWith("com.roblox") || pkg.startsWith("com.mojang") || pkg.startsWith("com.activision.")
+                    || pkg.startsWith("com.miHoYo.") || pkg.startsWith("com.HoYoverse.") || pkg.startsWith("com.tencent.ig") || pkg.startsWith("com.pubg") || pkg.startsWith("com.kiloo.") || pkg.startsWith("com.epicgames.");
+        } catch (Exception ignored) { }
+        HttpURLConnection c = null;
+        try {
+            JSONObject o = new JSONObject();
+            o.put("pkg", pkg); o.put("label", label); o.put("game", game);
+            c = (HttpURLConnection) new URL(base + "/phone/app").openConnection();
+            c.setRequestMethod("POST");
+            c.setDoOutput(true);
+            c.setConnectTimeout(5000);
+            c.setReadTimeout(5000);
+            c.setRequestProperty("Content-Type", "application/json");
+            String ck = CookieManager.getInstance().getCookie(base);
+            if (ck != null) c.setRequestProperty("Cookie", ck);
+            c.getOutputStream().write(o.toString().getBytes("UTF-8"));
+            c.getResponseCode();
+        } catch (Exception ignored) {
+        } finally {
+            if (c != null) c.disconnect();
+        }
+    }
 
     @Override
     public void onInterrupt() { }
@@ -155,7 +198,7 @@ public class PocketAccessibilityService extends AccessibilityService {
                 unlock(c.optString("pin", ""));
                 break;
             case "touch":
-                touch(c.optString("p", "u"), c.optDouble("x", 0), c.optDouble("y", 0));
+                touch(c.optString("p", "u"), c.optInt("id", 0), c.optDouble("x", 0), c.optDouble("y", 0));
                 break;
             case "rot":
                 orient(c.optString("o", "auto"));
@@ -174,51 +217,72 @@ public class PocketAccessibilityService extends AccessibilityService {
         }
     }
 
-    // ---- live touch: a finger that stays down while the PC mouse is held, so games can hold and drag
+    // ---- live touch: fingers that stay down while the PC mouse/keys are held (several at once: a joystick and a button)
+    private static final class Finger {
+        GestureDescription.StrokeDescription stroke;     // null until its first piece has been sent
+        float x, y, wx, wy;                             // where it is, where it should go
+        boolean fresh = true, wantMove, wantUp;
+    }
+
     private final Object touchLock = new Object();
-    private GestureDescription.StrokeDescription touchStroke;
-    private boolean touchBusy, wantMove, wantUp;
-    private float lastX, lastY, wantX, wantY;
+    private final java.util.HashMap<Integer, Finger> fingers = new java.util.HashMap<>();
+    private boolean touchBusy;
 
     private final AccessibilityService.GestureResultCallback touchCb = new AccessibilityService.GestureResultCallback() {
         @Override public void onCompleted(GestureDescription g) { synchronized (touchLock) { touchBusy = false; touchPump(); } }
-        @Override public void onCancelled(GestureDescription g) { synchronized (touchLock) { touchBusy = false; touchStroke = null; wantMove = false; wantUp = false; } }
+        @Override public void onCancelled(GestureDescription g) { synchronized (touchLock) { touchBusy = false; fingers.clear(); } }
     };
 
-    private void touch(String phase, double fx, double fy) {
-        DisplayMetrics m = getResources().getDisplayMetrics();
+    private void touch(String phase, int id, double fx, double fy) {
+        DisplayMetrics m = RealScreen.get(this);
         float x = (float) (fx * (m.widthPixels - 1)), y = (float) (fy * (m.heightPixels - 1));
         synchronized (touchLock) {
-            if (phase.equals("d") && touchStroke == null && !touchBusy) {
-                lastX = x; lastY = y; wantMove = false; wantUp = false;
-                Path p = new Path();
-                p.moveTo(x, y);
-                touchStroke = new GestureDescription.StrokeDescription(p, 0, 1, true);
-                touchBusy = true;
-                if (!dispatchGesture(new GestureDescription.Builder().addStroke(touchStroke).build(), touchCb, null)) { touchBusy = false; touchStroke = null; }
-            } else if (phase.equals("u")) {
-                wantX = x; wantY = y; wantMove = true; wantUp = true;
-                touchPump();
-            } else if (touchStroke != null || touchBusy) {      // a move (or a stray second "down")
-                wantX = x; wantY = y; wantMove = true;
-                touchPump();
+            Finger f = fingers.get(id);
+            if (phase.equals("d")) {
+                if (f != null) return;                     // already down
+                f = new Finger();
+                f.x = f.wx = x; f.y = f.wy = y;
+                fingers.put(id, f);
+            } else if (f == null) {
+                return;
+            } else {
+                f.wx = x; f.wy = y; f.wantMove = true;
+                if (phase.equals("u")) f.wantUp = true;
             }
+            touchPump();
         }
     }
 
-    /** Sends the newest wanted finger position as the next piece of the held stroke. Call with touchLock held. */
+    /** Sends the next piece of every finger that is down, in one gesture. Call with touchLock held. */
     private void touchPump() {
-        if (touchBusy || touchStroke == null || !(wantMove || wantUp)) return;
-        float tx = wantMove ? wantX : lastX, ty = wantMove ? wantY : lastY;
-        boolean end = wantUp;
-        Path p = new Path();
-        p.moveTo(lastX, lastY);
-        p.lineTo(tx, ty);
-        GestureDescription.StrokeDescription next = touchStroke.continueStroke(p, 0, end ? 1 : 12, !end);
-        lastX = tx; lastY = ty; wantMove = false; wantUp = false;
-        touchStroke = end ? null : next;
+        if (touchBusy || fingers.isEmpty()) return;
+        boolean work = false;
+        for (Finger f : fingers.values()) if (f.fresh || f.wantMove || f.wantUp) work = true;
+        if (!work) return;
+        GestureDescription.Builder b = new GestureDescription.Builder();
+        java.util.Iterator<java.util.Map.Entry<Integer, Finger>> it = fingers.entrySet().iterator();
+        int n = 0;
+        while (it.hasNext() && n < 9) {
+            Finger f = it.next().getValue();
+            Path p = new Path();
+            if (f.fresh) {
+                p.moveTo(f.x, f.y);
+                f.stroke = new GestureDescription.StrokeDescription(p, 0, 1, true);
+                f.fresh = false;
+            } else {
+                boolean end = f.wantUp;
+                float tx = f.wantMove ? f.wx : f.x, ty = f.wantMove ? f.wy : f.y;
+                p.moveTo(f.x, f.y);
+                p.lineTo(tx, ty);
+                f.stroke = f.stroke.continueStroke(p, 0, end ? 1 : 12, !end);
+                f.x = tx; f.y = ty; f.wantMove = false;
+                if (end) { b.addStroke(f.stroke); n++; it.remove(); continue; }
+            }
+            b.addStroke(f.stroke);
+            n++;
+        }
         touchBusy = true;
-        if (!dispatchGesture(new GestureDescription.Builder().addStroke(next).build(), touchCb, null)) { touchBusy = false; touchStroke = null; }
+        if (!dispatchGesture(b.build(), touchCb, null)) { touchBusy = false; fingers.clear(); }
     }
 
     // ---- really rotating the phone: a see-through window that asks Android for an orientation
@@ -249,7 +313,7 @@ public class PocketAccessibilityService extends AccessibilityService {
     }
 
     private void gesture(double x1, double y1, double x2, double y2, int ms) {
-        DisplayMetrics m = getResources().getDisplayMetrics();
+        DisplayMetrics m = RealScreen.get(this);
         Path p = new Path();
         p.moveTo((float) (x1 * (m.widthPixels - 1)), (float) (y1 * (m.heightPixels - 1)));
         if (x1 != x2 || y1 != y2) p.lineTo((float) (x2 * (m.widthPixels - 1)), (float) (y2 * (m.heightPixels - 1)));

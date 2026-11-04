@@ -2,7 +2,7 @@ package app.pocketdesk;
 
 /** Sharing limits chosen on the PC (max frame rate and the longest side of the picture). Applied live. */
 public final class ShareSettings {
-    public static volatile int maxFps = 30;
+    public static volatile int maxFps = 60;
     public static volatile int maxEdge = 1280;
 
     private ShareSettings() { }
