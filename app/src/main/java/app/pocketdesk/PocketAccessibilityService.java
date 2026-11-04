@@ -178,7 +178,10 @@ public class PocketAccessibilityService extends AccessibilityService {
 
     private void run(JSONObject c) throws Exception {
         String t = c.getString("t");
+        lastCmdAt = SystemClock.uptimeMillis();
         switch (t) {
+            case "hb":
+                break;                                  // nothing to do: the PC says its fingers are still held
             case "tap":
                 gesture(c.getDouble("x"), c.getDouble("y"), c.getDouble("x"), c.getDouble("y"), 50);
                 break;
@@ -226,6 +229,7 @@ public class PocketAccessibilityService extends AccessibilityService {
     private static final class Finger {
         GestureDescription.StrokeDescription stroke;     // null until its first piece has been sent
         float x, y, wx, wy;                             // where it is, where it should go
+        float ox, oy;                                   // where it first touched down (a floating joystick's centre)
         boolean fresh = true, wantMove, wantUp;
     }
 
@@ -247,7 +251,12 @@ public class PocketAccessibilityService extends AccessibilityService {
                 while (it.hasNext()) {
                     Finger f = it.next();
                     if (f.wantUp) { it.remove(); continue; }
-                    f.fresh = true; f.stroke = null; f.wantMove = false;
+                    // down again where it first touched (a joystick's centre), then on to where it was: pressing it back at the
+                    // far end would look to the game like a stick that points nowhere
+                    f.wx = f.x; f.wy = f.y;
+                    f.x = f.ox; f.y = f.oy;
+                    f.wantMove = f.wx != f.ox || f.wy != f.oy;
+                    f.fresh = true; f.stroke = null;
                 }
                 touchPump();
             }
@@ -255,6 +264,34 @@ public class PocketAccessibilityService extends AccessibilityService {
     };
     private long cancelWindow;
     private int cancels;
+
+    // ---- dead-man switch: while fingers are down the PC keeps talking (a few messages a second). If it goes quiet, the link is
+    // in trouble, and a finger held down by a message that will never be followed by its "let go" would send the character running.
+    private static final long DEADMAN_MS = 700;
+    private volatile long lastCmdAt;
+    private Thread deadman;
+
+    private void startDeadman() {
+        if (deadman != null) return;
+        deadman = new Thread(() -> {
+            while (alive) {
+                try { Thread.sleep(100); } catch (InterruptedException e) { return; }
+                synchronized (touchLock) {
+                    if (fingers.isEmpty()) continue;
+                    long idle = SystemClock.uptimeMillis() - lastCmdAt;
+                    if (idle < DEADMAN_MS) continue;
+                    boolean any = false;
+                    for (Finger f : fingers.values()) if (!f.wantUp) { f.wantUp = true; f.wantMove = false; any = true; }
+                    if (any) {
+                        phoneLog("nothing came from the PC for " + idle + " ms: let go of the touch so the character cannot run on");
+                        touchPump();
+                    }
+                }
+            }
+        }, "pd-deadman");
+        deadman.setDaemon(true);
+        deadman.start();
+    }
 
     /** Sends one diagnostic line to the PC's log (journalctl --user -u pocketdesk). */
     private void phoneLog(final String msg) {
@@ -291,8 +328,9 @@ public class PocketAccessibilityService extends AccessibilityService {
             if (phase.equals("d")) {
                 if (f != null) return;                     // already down
                 f = new Finger();
-                f.x = f.wx = x; f.y = f.wy = y;
+                f.x = f.wx = f.ox = x; f.y = f.wy = f.oy = y;
                 fingers.put(id, f);
+                startDeadman();
             } else if (f == null) {
                 return;
             } else {
