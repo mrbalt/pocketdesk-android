@@ -1,5 +1,6 @@
 package app.pocketdesk;
 
+import android.os.SystemClock;
 import android.webkit.CookieManager;
 
 import java.io.OutputStream;
@@ -18,6 +19,7 @@ public class AudioUploader {
     private final LinkedBlockingDeque<byte[]> q = new LinkedBlockingDeque<>(40);
     private volatile boolean alive = true;
     private final Thread thread;
+    private long lastSlowLog;
 
     public AudioUploader(String base, int rate, int channels) {
         this.base = base;
@@ -51,8 +53,14 @@ public class AudioUploader {
                 while (alive) {
                     byte[] b = q.poll(2, TimeUnit.SECONDS);
                     if (b == null) continue;
+                    long t = SystemClock.uptimeMillis();
                     os.write(b);
                     os.flush();
+                    long took = SystemClock.uptimeMillis() - t;
+                    if (took > 400 && t - lastSlowLog > 3000) {
+                        lastSlowLog = t;
+                        PcLog.send(base, "sound upload slow: one piece took " + took + " ms to send");
+                    }
                 }
             } catch (Exception e) {
                 if (!alive) break;

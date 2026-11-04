@@ -228,8 +228,15 @@ public class ScreenShareService extends Service {
             audioLoop = true;
             Thread t = new Thread(() -> {
                 byte[] buf = new byte[rate * 2 * 2 / 40];     // 25 ms of 16-bit stereo
+                long lastRead = SystemClock.uptimeMillis(), lastGapLog = 0;
                 while (audioLoop) {
                     int n = audioRec.read(buf, 0, buf.length);
+                    long nowRead = SystemClock.uptimeMillis();
+                    if (nowRead - lastRead > 400 && nowRead - lastGapLog > 3000) {     // the capture itself went quiet (not the network)
+                        lastGapLog = nowRead;
+                        PcLog.send(base, "sound capture gave nothing for " + (nowRead - lastRead) + " ms");
+                    }
+                    lastRead = nowRead;
                     if (n > 0) {
                         byte[] out = new byte[n];
                         System.arraycopy(buf, 0, out, 0, n);

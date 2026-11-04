@@ -418,6 +418,10 @@ public class PocketAccessibilityService extends AccessibilityService {
     private void startScreenshotShare() {
         String base = baseUrl();
         if (shotLoop || base == null || Build.VERSION.SDK_INT < 30) return;
+        if (ScreenShareService.running) {          // Smooth sharing already carries the picture: a second, screenshot-based one only adds load
+            PcLog.send(base, "no-prompt sharing ignored: Smooth sharing is already running");
+            return;
+        }
         shotLoop = true;
         sharing = true;
         shotUp = new FrameUploader(base);
