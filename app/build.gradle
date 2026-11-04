@@ -11,8 +11,8 @@ android {
         minSdk 24
         // 34 on purpose: keeps the soft keyboard resizing the page normally (Android 15 forces edge-to-edge above that)
         targetSdk 34
-        versionCode 14
-        versionName '0.9.4'
+        versionCode 15
+        versionName '0.9.5'
     }
 
     // One fixed key for every build, so a newer APK installs over the old one without uninstalling first.

@@ -230,8 +230,52 @@ public class PocketAccessibilityService extends AccessibilityService {
 
     private final AccessibilityService.GestureResultCallback touchCb = new AccessibilityService.GestureResultCallback() {
         @Override public void onCompleted(GestureDescription g) { synchronized (touchLock) { touchBusy = false; touchPump(); } }
-        @Override public void onCancelled(GestureDescription g) { synchronized (touchLock) { touchBusy = false; fingers.clear(); } }
+        @Override public void onCancelled(GestureDescription g) {
+            synchronized (touchLock) {
+                touchBusy = false;
+                long now = SystemClock.uptimeMillis();
+                if (now - cancelWindow > 1500) { cancelWindow = now; cancels = 0; }
+                phoneLog("touch gesture cancelled with " + fingers.size() + " finger(s) down (#" + (cancels + 1) + ")");
+                if (++cancels > 4) { fingers.clear(); return; }
+                // put every finger that is still wanted back down where it was, so a cancelled gesture does not leave a joystick dead
+                java.util.Iterator<Finger> it = fingers.values().iterator();
+                while (it.hasNext()) {
+                    Finger f = it.next();
+                    if (f.wantUp) { it.remove(); continue; }
+                    f.fresh = true; f.stroke = null; f.wantMove = false;
+                }
+                touchPump();
+            }
+        }
     };
+    private long cancelWindow;
+    private int cancels;
+
+    /** Sends one diagnostic line to the PC's log (journalctl --user -u pocketdesk). */
+    private void phoneLog(final String msg) {
+        final String base = baseUrl();
+        if (base == null) return;
+        new Thread(() -> {
+            HttpURLConnection c = null;
+            try {
+                JSONObject o = new JSONObject();
+                o.put("m", msg);
+                c = (HttpURLConnection) new URL(base + "/phone/log").openConnection();
+                c.setRequestMethod("POST");
+                c.setDoOutput(true);
+                c.setConnectTimeout(3000);
+                c.setReadTimeout(3000);
+                c.setRequestProperty("Content-Type", "application/json");
+                String ck = CookieManager.getInstance().getCookie(base);
+                if (ck != null) c.setRequestProperty("Cookie", ck);
+                c.getOutputStream().write(o.toString().getBytes("UTF-8"));
+                c.getResponseCode();
+            } catch (Exception ignored) {
+            } finally {
+                if (c != null) c.disconnect();
+            }
+        }, "pd-log").start();
+    }
 
     private void touch(String phase, int id, double fx, double fy) {
         DisplayMetrics m = RealScreen.get(this);
@@ -282,7 +326,7 @@ public class PocketAccessibilityService extends AccessibilityService {
             n++;
         }
         touchBusy = true;
-        if (!dispatchGesture(b.build(), touchCb, null)) { touchBusy = false; fingers.clear(); }
+        if (!dispatchGesture(b.build(), touchCb, null)) { touchBusy = false; fingers.clear(); phoneLog("Android refused the touch gesture (" + n + " finger(s))"); }
     }
 
     // ---- really rotating the phone: a see-through window that asks Android for an orientation
