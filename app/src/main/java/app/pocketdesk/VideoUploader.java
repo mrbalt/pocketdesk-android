@@ -1,5 +1,6 @@
 package app.pocketdesk;
 
+import android.os.SystemClock;
 import android.webkit.CookieManager;
 
 import java.io.OutputStream;
@@ -17,6 +18,8 @@ import java.util.ArrayDeque;
  */
 final class VideoUploader {
     private static final int MAX_QUEUE = 10;
+    /** A send that has been stuck this long means the connection is in trouble: drop it and open a fresh one. */
+    private static final long STALL_MS = 1200;
 
     private final String base;
     private final int w, h;
@@ -28,6 +31,12 @@ final class VideoUploader {
     private boolean dropping;
     private volatile boolean alive = true;
     private final Thread thread;
+    private volatile long writeStart;          // uptime when the send in progress began (0 = none)
+    private volatile Socket cur;
+    private volatile boolean stalled;
+    private volatile long stalledMs;
+    private long lastSlowLog;
+    private long lastAbort;
 
     VideoUploader(String base, int w, int h, Events events) {
         this.base = base;
@@ -39,7 +48,23 @@ final class VideoUploader {
         thread.start();
     }
 
+    /** Called for every frame the encoder makes, so it doubles as the watchdog: a send stuck for too long is abandoned. */
+    private void checkStall() {
+        long ws = writeStart;
+        Socket s = cur;
+        long now = SystemClock.uptimeMillis();
+        if (ws != 0 && s != null && now - ws > STALL_MS && now - lastAbort > 3000) {     // not more than once in 3 s, so a merely slow link cannot make us flap
+            lastAbort = now;
+            stalledMs = now - ws;
+            stalled = true;
+            writeStart = 0;
+            try { s.setSoLinger(true, 0); } catch (Exception ignored) { }     // throw away what is stuck instead of trickling it out later
+            try { s.close(); } catch (Exception ignored) { }
+        }
+    }
+
     void offer(byte[] data, boolean key) {
+        checkStall();
         boolean overflowed = false;
         synchronized (lock) {
             if (dropping && !key) return;
@@ -80,6 +105,12 @@ final class VideoUploader {
                 backoff = 1000;
             } catch (Exception e) {
                 if (!alive) break;
+                if (stalled) {                                   // not a failure to wait out: reconnect straight away
+                    stalled = false;
+                    backoff = 1000;
+                    PcLog.send(base, "video upload was stuck for " + stalledMs + " ms; reconnecting");
+                    continue;
+                }
                 try { Thread.sleep(backoff); } catch (InterruptedException ignored) { }
                 backoff = Math.min(backoff * 2, 5000);
             }
@@ -89,6 +120,7 @@ final class VideoUploader {
     private void runSocket(URL u) throws Exception {
         int port = u.getPort() > 0 ? u.getPort() : 80;
         final Socket sk = new Socket();
+        cur = sk;
         try {
             sk.setTcpNoDelay(true);
             sk.setSendBufferSize(64 * 1024);
@@ -114,10 +146,20 @@ final class VideoUploader {
                 System.arraycopy(f, 0, chunk, pre.length, f.length);
                 chunk[chunk.length - 2] = '\r';
                 chunk[chunk.length - 1] = '\n';
+                long t = SystemClock.uptimeMillis();
+                writeStart = t;
                 os.write(chunk);
                 os.flush();
+                writeStart = 0;
+                long took = SystemClock.uptimeMillis() - t;
+                if (took > 500 && t - lastSlowLog > 3000) {
+                    lastSlowLog = t;
+                    PcLog.send(base, "video upload slow: one frame took " + took + " ms to send");
+                }
             }
         } finally {
+            writeStart = 0;
+            cur = null;
             try { sk.close(); } catch (Exception ignored) { }
         }
     }

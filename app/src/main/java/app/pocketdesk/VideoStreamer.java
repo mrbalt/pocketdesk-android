@@ -22,9 +22,11 @@ final class VideoStreamer {
     private byte[] config;
     private int kbps;
     private final int maxKbps;
-    private long lastDrop, lastRaise;
+    private long lastDrop, lastRaise, lastKeyOut, lastKeyReq, lastLog;
+    private final String base;
 
     VideoStreamer(String base, int w, int h, int fps, int kbps) throws Exception {
+        this.base = base;
         this.kbps = kbps;
         this.maxKbps = kbps;
         MediaCodec c = MediaCodec.createEncoderByType("video/avc");
@@ -75,6 +77,10 @@ final class VideoStreamer {
             lastDrop = now;
             kbps = Math.max(1500, kbps * 4 / 5);
             setBitrate();
+            if (now - lastLog > 2000) {
+                lastLog = now;
+                PcLog.send(base, "video: the link could not keep up, dropped the backlog; bitrate now " + kbps + " kbps");
+            }
         }
     }
 
@@ -102,8 +108,16 @@ final class VideoStreamer {
     private void drainLoop() {
         MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
         lastRaise = SystemClock.uptimeMillis();
+        lastKeyOut = lastKeyReq = lastRaise;
         try {
             while (alive) {
+                long t = SystemClock.uptimeMillis();
+                // A full picture at least once a second, however quiet the screen: whoever missed frames (a stalled link, a
+                // window that fell behind) can rejoin within a second instead of waiting for the encoder's own, much slower, rhythm.
+                if (t - lastKeyOut > 1000 && t - lastKeyReq > 700) {
+                    lastKeyReq = t;
+                    requestKey();
+                }
                 int i = enc.dequeueOutputBuffer(info, 50000);
                 if (i < 0) continue;
                 try {
@@ -117,6 +131,7 @@ final class VideoStreamer {
                             config = data;
                         } else {
                             boolean key = (info.flags & MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0;
+                            if (key) lastKeyOut = SystemClock.uptimeMillis();
                             if (key && config != null && !startsWithSps(data)) {
                                 byte[] withCfg = new byte[config.length + data.length];
                                 System.arraycopy(config, 0, withCfg, 0, config.length);
