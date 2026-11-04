@@ -4,6 +4,8 @@ import android.webkit.CookieManager;
 
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.net.URL;
 
 /**
@@ -57,39 +59,93 @@ public class FrameUploader {
     private void run() {
         int backoff = 1000;
         while (alive) {
-            HttpURLConnection c = null;
             try {
-                c = (HttpURLConnection) new URL(base + "/phone/stream").openConnection();
-                c.setRequestMethod("POST");
-                c.setDoOutput(true);
-                c.setConnectTimeout(6000);
-                c.setReadTimeout(0);
-                c.setChunkedStreamingMode(0);
-                c.setRequestProperty("Content-Type", "application/octet-stream");
-                String ck = CookieManager.getInstance().getCookie(base);
-                if (ck != null) c.setRequestProperty("Cookie", ck);
-                OutputStream os = c.getOutputStream();
+                URL u = new URL(base + "/phone/stream");
+                if (u.getProtocol().equals("http")) runSocket(u); else runHttps();
                 backoff = 1000;
-                while (alive) {
-                    byte[] f;
-                    synchronized (lock) {
-                        while (pending == null && alive) lock.wait(3000);
-                        f = pending;
-                        pending = null;
-                    }
-                    if (f == null) continue;
-                    byte[] head = {(byte) (f.length >>> 24), (byte) (f.length >>> 16), (byte) (f.length >>> 8), (byte) f.length};
-                    os.write(head);
-                    os.write(f);
-                    os.flush();
-                }
             } catch (Exception e) {
                 if (!alive) break;
                 try { Thread.sleep(backoff); } catch (InterruptedException ignored) { }
                 backoff = Math.min(backoff * 2, 5000);
-            } finally {
-                if (c != null) c.disconnect();
             }
+        }
+    }
+
+    private byte[] nextFrame() throws InterruptedException {
+        synchronized (lock) {
+            while (pending == null && alive) lock.wait(3000);
+            byte[] f = pending;
+            pending = null;
+            return f;
+        }
+    }
+
+    /**
+     * Plain-http upload over our own socket with a SMALL send buffer. With the system's big default buffer, hundreds of
+     * milliseconds of old frames pile up in it and the picture arrives late; a small buffer makes the writer wait instead,
+     * so stale frames are dropped here and the newest one is always next.
+     */
+    private void runSocket(URL u) throws Exception {
+        int port = u.getPort() > 0 ? u.getPort() : 80;
+        final Socket sk = new Socket();
+        try {
+            sk.setTcpNoDelay(true);
+            sk.setSendBufferSize(32 * 1024);
+            sk.connect(new InetSocketAddress(u.getHost(), port), 6000);
+            OutputStream os = sk.getOutputStream();
+            String ck = CookieManager.getInstance().getCookie(base);
+            String req = "POST /phone/stream HTTP/1.1\r\nHost: " + u.getHost() + ":" + port + "\r\nContent-Type: application/octet-stream\r\n"
+                    + "Transfer-Encoding: chunked\r\n" + (ck != null ? "Cookie: " + ck + "\r\n" : "") + "\r\n";
+            os.write(req.getBytes("US-ASCII"));
+            os.flush();
+            Thread drain = new Thread(() -> {          // read (and ignore) the reply; if the server hangs up, wake the writer
+                try { byte[] b = new byte[512]; while (sk.getInputStream().read(b) >= 0) { } } catch (Exception ignored) { }
+                try { sk.close(); } catch (Exception ignored) { }
+            }, "pd-upload-in");
+            drain.setDaemon(true);
+            drain.start();
+            while (alive) {
+                byte[] f = nextFrame();
+                if (f == null) continue;
+                byte[] pre = (Integer.toHexString(f.length + 4) + "\r\n").getBytes("US-ASCII");
+                byte[] head = {(byte) (f.length >>> 24), (byte) (f.length >>> 16), (byte) (f.length >>> 8), (byte) f.length};
+                byte[] chunk = new byte[pre.length + 4 + f.length + 2];
+                System.arraycopy(pre, 0, chunk, 0, pre.length);
+                System.arraycopy(head, 0, chunk, pre.length, 4);
+                System.arraycopy(f, 0, chunk, pre.length + 4, f.length);
+                chunk[chunk.length - 2] = '\r';
+                chunk[chunk.length - 1] = '\n';
+                os.write(chunk);
+                os.flush();
+            }
+        } finally {
+            try { sk.close(); } catch (Exception ignored) { }
+        }
+    }
+
+    private void runHttps() throws Exception {
+        HttpURLConnection c = null;
+        try {
+            c = (HttpURLConnection) new URL(base + "/phone/stream").openConnection();
+            c.setRequestMethod("POST");
+            c.setDoOutput(true);
+            c.setConnectTimeout(6000);
+            c.setReadTimeout(0);
+            c.setChunkedStreamingMode(0);
+            c.setRequestProperty("Content-Type", "application/octet-stream");
+            String ck = CookieManager.getInstance().getCookie(base);
+            if (ck != null) c.setRequestProperty("Cookie", ck);
+            OutputStream os = c.getOutputStream();
+            while (alive) {
+                byte[] f = nextFrame();
+                if (f == null) continue;
+                byte[] head = {(byte) (f.length >>> 24), (byte) (f.length >>> 16), (byte) (f.length >>> 8), (byte) f.length};
+                os.write(head);
+                os.write(f);
+                os.flush();
+            }
+        } finally {
+            if (c != null) c.disconnect();
         }
     }
 
